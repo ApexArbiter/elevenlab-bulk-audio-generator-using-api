@@ -1,0 +1,14 @@
+# Environment
+.env
+
+# Virtual environment
+venv/
+
+# Generated audio
+output_audio/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
