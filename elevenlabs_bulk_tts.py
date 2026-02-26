@@ -4,7 +4,7 @@ ElevenLabs bulk TTS — interactive setup, parallel generation.
 
 CSV format: only a `text` column is needed.
   - Output filename is derived from the text with all [tags] stripped out.
-  - Voice, speed, and workers are chosen interactively at startup.
+  - Voice, speed, stability, and workers are chosen interactively at startup.
 
 Voices in .env: add entries like  Natasha=<voice_id>  (any key besides ELEVENLABS_API_KEY).
 ElevenLabs native tags (eleven_v3 model) — write directly in text:
@@ -13,11 +13,17 @@ ElevenLabs native tags (eleven_v3 model) — write directly in text:
   [sigh] [laughs] [gulps] [gasps] [whispers] [clears throat] [pauses]
   [hesitates] [stammers] [resigned tone] [shouts] [quietly] [loudly] [rushed]
   [break] / [break 1.5s]  →  SSML <break time="..." /> pause
+
+Silence check:
+  After each generation the audio is inspected. If leading silence is more than
+  50% of the total duration the file is automatically regenerated once. If the
+  retry still has the issue it is kept as-is (so you never lose the file).
 """
 
 from __future__ import annotations
 
 import csv
+import io
 import os
 import re
 import sys
@@ -41,6 +47,9 @@ API_BASE = "https://api.elevenlabs.io/v1"
 DEFAULT_OUTPUT_DIR = _SCRIPT_DIR / "output_audio"
 DEFAULT_MODEL_ID = "eleven_v3"
 DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
+DEFAULT_STABILITY = 0.5      # 0.0 = more expressive/variable, 1.0 = very stable/consistent
+SILENCE_THRESH_DB = -40.0    # dBFS below which audio is considered silence
+MAX_LEADING_SILENCE_RATIO = 0.5  # retry if leading silence > 50% of total duration
 
 _print_lock = threading.Lock()
 
@@ -139,6 +148,24 @@ def prompt_speed() -> float | None:
         return None
 
 
+def prompt_stability() -> float:
+    """Ask for voice stability. Returns float 0.0–1.0."""
+    print("\n--- Voice Stability ---")
+    print("  0.0 = more expressive & variable  |  1.0 = very stable & consistent")
+    print(f"  Recommended for eleven_v3: 0.3–0.6  (default: {DEFAULT_STABILITY})")
+    raw = input(f"Enter stability [press Enter for {DEFAULT_STABILITY}]: ").strip()
+    if not raw:
+        print(f"  Using default stability: {DEFAULT_STABILITY}")
+        return DEFAULT_STABILITY
+    try:
+        s = round(max(0.0, min(1.0, float(raw))), 2)
+        print(f"  Stability: {s}")
+        return s
+    except ValueError:
+        print(f"  Invalid input — using default stability: {DEFAULT_STABILITY}")
+        return DEFAULT_STABILITY
+
+
 def prompt_workers() -> int:
     """Ask how many parallel workers to use."""
     print("\n--- Parallel Workers ---")
@@ -193,6 +220,41 @@ def make_output_name(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Silence detection
+# ---------------------------------------------------------------------------
+
+def leading_silence_ratio(audio_bytes: bytes, ext: str) -> float:
+    """
+    Returns the fraction (0.0–1.0) of the total audio that is leading silence
+    before the first speech is detected.
+
+    Uses pydub + ffmpeg. Returns 0.0 if pydub is unavailable or the check fails
+    so the file is always kept in that case.
+    """
+    try:
+        from pydub import AudioSegment
+        from pydub.silence import detect_nonsilent
+
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
+        total_ms = len(audio)
+        if total_ms == 0:
+            return 0.0
+
+        non_silent = detect_nonsilent(
+            audio,
+            min_silence_len=100,       # ms of continuous silence to count
+            silence_thresh=SILENCE_THRESH_DB,
+        )
+        if not non_silent:
+            return 1.0  # entirely silent
+
+        first_speech_ms = non_silent[0][0]
+        return first_speech_ms / total_ms
+    except Exception:
+        return 0.0  # never block generation if check fails
+
+
+# ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
 
@@ -204,12 +266,18 @@ def generate_speech(
     model_id: str = DEFAULT_MODEL_ID,
     output_format: str = DEFAULT_OUTPUT_FORMAT,
     speed: float | None = None,
+    stability: float = DEFAULT_STABILITY,
 ) -> bytes:
     url = f"{API_BASE}/text-to-speech/{voice_id}"
     headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
     payload: dict = {"text": text, "model_id": model_id}
+
+    # Always send voice_settings so stability is applied even at default speed
+    voice_settings: dict = {"stability": stability}
     if speed is not None and speed != 1.0:
-        payload["voice_settings"] = {"speed": speed}
+        voice_settings["speed"] = speed
+    payload["voice_settings"] = voice_settings
+
     r = requests.post(
         url,
         headers=headers,
@@ -238,6 +306,7 @@ def process_one_row(
     model_id: str,
     output_format: str,
     speed: float | None,
+    stability: float,
     idx: int,
     total: int,
 ) -> str:
@@ -251,18 +320,41 @@ def process_one_row(
     if not text:
         raise ValueError("Empty text after preprocessing")
 
-    audio_bytes = generate_speech(
-        api_key, voice_id, text,
-        model_id=model_id, output_format=output_format, speed=speed,
-    )
-
     ext = "mp3" if "mp3" in output_format else "wav" if "wav" in output_format else "ogg"
+
+    def _call_api() -> bytes:
+        return generate_speech(
+            api_key, voice_id, text,
+            model_id=model_id, output_format=output_format,
+            speed=speed, stability=stability,
+        )
+
+    audio_bytes = _call_api()
+
+    # --- Silence check: retry once if leading silence > 50% of total duration ---
+    ratio = leading_silence_ratio(audio_bytes, ext)
+    if ratio > MAX_LEADING_SILENCE_RATIO:
+        safe_print(
+            f"  [{idx}/{total}] Leading silence {ratio:.0%} detected — retrying: {output_name}.{ext}"
+        )
+        retry_bytes = _call_api()
+        retry_ratio = leading_silence_ratio(retry_bytes, ext)
+        if retry_ratio > MAX_LEADING_SILENCE_RATIO:
+            safe_print(
+                f"  [{idx}/{total}] Retry still has {retry_ratio:.0%} leading silence — keeping retry: {output_name}.{ext}"
+            )
+        else:
+            safe_print(
+                f"  [{idx}/{total}] Retry OK ({retry_ratio:.0%} silence): {output_name}.{ext}"
+            )
+        audio_bytes = retry_bytes  # always use the retry result
+
     out_path = output_dir / f"{output_name}.{ext}"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(audio_bytes)
 
-    safe_print(f"  [{idx}/{total}] {out_path.name}")
+    safe_print(f"  [{idx}/{total}] Saved: {out_path.name}")
     return out_path.name
 
 
@@ -329,6 +421,7 @@ def main() -> None:
 
     voice_label, voice_id = prompt_voice(voices)
     speed = prompt_speed()
+    stability = prompt_stability()
     workers = prompt_workers()
 
     # --- Load CSV ---
@@ -341,12 +434,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*50}")
-    print(f"Voice   : {voice_label}")
-    print(f"Speed   : {speed if speed is not None else '1.0 (default)'}")
-    print(f"Model   : {args.model}")
-    print(f"Rows    : {len(texts)}")
-    print(f"Workers : {workers}")
-    print(f"Output  : {output_dir}")
+    print(f"Voice     : {voice_label}")
+    print(f"Speed     : {speed if speed is not None else '1.0 (default)'}")
+    print(f"Stability : {stability}")
+    print(f"Model     : {args.model}")
+    print(f"Rows      : {len(texts)}")
+    print(f"Workers   : {workers}")
+    print(f"Output    : {output_dir}")
     print(f"{'='*50}\n")
 
     # --- Generate in parallel ---
@@ -362,6 +456,7 @@ def main() -> None:
                 args.model,
                 args.output_format,
                 speed,
+                stability,
                 i + 1,
                 total,
             ): text
