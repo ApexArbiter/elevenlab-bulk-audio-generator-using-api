@@ -17,7 +17,8 @@ ElevenLabs native tags (eleven_v3 model) — write directly in text:
 Silence check:
   After each generation the audio is inspected. If leading silence is more than
   50% of the total duration the file is automatically regenerated once. If the
-  retry still has the issue it is kept as-is (so you never lose the file).
+  retry still has the issue it is saved to a separate "needs_review" folder
+  (or the main folder, your choice). A full stats summary is printed at the end.
 """
 
 from __future__ import annotations
@@ -50,6 +51,19 @@ DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 DEFAULT_STABILITY = 0.5      # 0.0 = more expressive/variable, 1.0 = very stable/consistent
 SILENCE_THRESH_DB = -40.0    # dBFS below which audio is considered silence
 MAX_LEADING_SILENCE_RATIO = 0.5  # retry if leading silence > 50% of total duration
+
+# ElevenLabs models: (display_name, model_id, description, supports_speed, supports_tags)
+KNOWN_MODELS: list[tuple[str, str, str, bool, bool]] = [
+    ("eleven_v3",              "eleven_v3",              "Latest — emotion/style tags + speed param  [DEFAULT]", True,  True),
+    ("eleven_multilingual_v2", "eleven_multilingual_v2", "High quality, multilingual — speed param, no tags",    True,  False),
+    ("eleven_turbo_v2_5",      "eleven_turbo_v2_5",      "Fast & low-latency, multilingual — no speed/tags",    False, False),
+    ("eleven_turbo_v2",        "eleven_turbo_v2",        "Fast & low-latency, English — no speed/tags",         False, False),
+    ("eleven_monolingual_v1",  "eleven_monolingual_v1",  "Legacy English-only — no speed/tags",                 False, False),
+]
+
+# Quick lookup for capability flags by model_id
+_MODEL_SUPPORTS_SPEED: dict[str, bool] = {m[1]: m[3] for m in KNOWN_MODELS}
+_MODEL_SUPPORTS_TAGS:  dict[str, bool] = {m[1]: m[4] for m in KNOWN_MODELS}
 
 _print_lock = threading.Lock()
 
@@ -131,20 +145,87 @@ def prompt_voice(voices: list[tuple[str, str]]) -> tuple[str, str]:
         print(f"  Enter a number between 1 and {len(voices)}.")
 
 
-def prompt_speed() -> float | None:
-    """Ask for speech speed. Returns float or None (API default = 1.0)."""
-    print("\n--- Speech Speed ---")
-    print("  0.5 = slowest  |  1.0 = normal  |  2.0 = fastest")
+def prompt_model() -> str:
+    """Show ElevenLabs model list, return chosen model_id."""
+    print("\n--- Model Selection ---")
+    for i, (name, _, desc, sup_speed, sup_tags) in enumerate(KNOWN_MODELS, 1):
+        caps = []
+        if sup_tags:
+            caps.append("emotion tags")
+        if sup_speed:
+            caps.append("API speed control")
+        cap_str = f"  [supports: {', '.join(caps)}]" if caps else "  [no speed/tag support]"
+        print(f"  {i}. {name}")
+        print(f"     {desc}")
+        print(f"    {cap_str}")
+    while True:
+        raw = input(f"\nChoose model [1-{len(KNOWN_MODELS)}, press Enter for 1]: ").strip() or "1"
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(KNOWN_MODELS):
+                name, model_id, _, sup_speed, sup_tags = KNOWN_MODELS[idx - 1]
+                print(f"  Using: {name}")
+                if not sup_tags:
+                    print("  ⚠  This model ignores emotion tags like [happy], [calm] etc.")
+                if not sup_speed:
+                    print("  ⚠  This model does not support API speed control (use time-stretch instead).")
+                return model_id
+        except ValueError:
+            pass
+        print(f"  Enter a number between 1 and {len(KNOWN_MODELS)}.")
+
+
+def prompt_speed(model_id: str) -> float | None:
+    """
+    Ask for API-level speech speed.
+    Only sent to models that support it (eleven_v3, eleven_multilingual_v2).
+    For ultra-slow output use the post-process time-stretch (prompt_stretch).
+    """
+    print("\n--- Speech Speed (API) ---")
+    if not _MODEL_SUPPORTS_SPEED.get(model_id, False):
+        print(f"  ⚠  '{model_id}' does not support API speed — skipped.")
+        print("     Use the time-stretch option below to slow down audio.")
+        return None
+    print("  0.25 = very slow  |  0.7 = slow  |  1.0 = normal  |  2.0 = fast")
+    print("  Note: values below 0.7 can sound unnatural from the API.")
+    print("        Use the time-stretch option below for smoother slow-down.")
     raw = input("Enter speed [press Enter to use default 1.0]: ").strip()
     if not raw:
         print("  Using default speed.")
         return None
     try:
-        s = round(max(0.5, min(2.0, float(raw))), 2)
-        print(f"  Speed: {s}")
+        s = round(max(0.25, min(4.0, float(raw))), 2)
+        print(f"  API speed: {s}")
         return s
     except ValueError:
         print("  Invalid input — using default speed.")
+        return None
+
+
+def prompt_stretch() -> float | None:
+    """
+    Ask for optional post-processing time-stretch via ffmpeg.
+    This slows down (or speeds up) the final audio AFTER generation.
+    0.5 = half speed (2× longer), 0.25 = quarter speed (4× longer).
+    Returns None if skipped.
+    """
+    print("\n--- Post-Process Time Stretch (ffmpeg) ---")
+    print("  Slows down the generated audio using ffmpeg after download.")
+    print("  0.25 = quarter speed (very slow)  |  0.5 = half speed  |  1.0 = no change")
+    print("  Requires ffmpeg installed. Press Enter to skip.")
+    raw = input("Enter stretch factor [press Enter to skip]: ").strip()
+    if not raw:
+        print("  No time stretch.")
+        return None
+    try:
+        s = round(max(0.1, min(2.0, float(raw))), 3)
+        if s == 1.0:
+            print("  Factor is 1.0 — no stretch applied.")
+            return None
+        print(f"  Time stretch factor: {s}  (audio will be {1/s:.1f}× longer)")
+        return s
+    except ValueError:
+        print("  Invalid input — no time stretch.")
         return None
 
 
@@ -176,6 +257,28 @@ def prompt_workers() -> int:
         return max(1, min(20, int(raw)))
     except ValueError:
         return 5
+
+
+def prompt_unfixed_folder(output_dir: Path) -> Path | None:
+    """
+    Ask whether audios that still have leading silence after retry should go
+    into a separate folder. Returns that folder path, or None for same folder.
+    """
+    print("\n--- Unfixed Silence Files ---")
+    print("  Some audios may still have leading silence even after retry.")
+    print("  Where should those files be saved?")
+    print("  1. Separate folder (needs_review/)")
+    print("  2. Same output folder")
+    while True:
+        raw = input("Choose [1/2, press Enter for 1]: ").strip() or "1"
+        if raw == "1":
+            folder = output_dir / "needs_review"
+            print(f"  Unfixed files → {folder}")
+            return folder
+        if raw == "2":
+            print("  Unfixed files → same output folder")
+            return None
+        print("  Enter 1 or 2.")
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +358,59 @@ def leading_silence_ratio(audio_bytes: bytes, ext: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: time stretch via ffmpeg atempo
+# ---------------------------------------------------------------------------
+
+def apply_time_stretch(audio_bytes: bytes, ext: str, factor: float) -> bytes:
+    """
+    Slow down (or speed up) audio using ffmpeg's atempo filter.
+    factor < 1.0 = slower (e.g. 0.5 = half speed, 2× longer).
+    factor > 1.0 = faster.
+
+    atempo only accepts 0.5–2.0 per filter, so we chain them for extreme values:
+      0.25x → atempo=0.5,atempo=0.5
+      0.1x  → atempo=0.5,atempo=0.5,atempo=0.4
+    """
+    import subprocess
+    import tempfile
+
+    # Build the atempo filter chain
+    filters: list[str] = []
+    remaining = factor
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    filters.append(f"atempo={remaining:.6f}")
+    filter_str = ",".join(filters)
+
+    inp_file = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
+    out_file = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
+    try:
+        inp_file.write(audio_bytes)
+        inp_file.close()
+        out_file.close()
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", inp_file.name, "-af", filter_str, out_file.name],
+            check=True,
+            capture_output=True,
+        )
+        with open(out_file.name, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(inp_file.name)
+        except OSError:
+            pass
+        try:
+            os.unlink(out_file.name)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
 
@@ -272,9 +428,9 @@ def generate_speech(
     headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
     payload: dict = {"text": text, "model_id": model_id}
 
-    # Always send voice_settings so stability is applied even at default speed
     voice_settings: dict = {"stability": stability}
-    if speed is not None and speed != 1.0:
+    # Only send speed if the chosen model actually supports it — turbo models reject it with 400
+    if speed is not None and speed != 1.0 and _MODEL_SUPPORTS_SPEED.get(model_id, False):
         voice_settings["speed"] = speed
     payload["voice_settings"] = voice_settings
 
@@ -290,7 +446,14 @@ def generate_speech(
             "401 Unauthorized — check ELEVENLABS_API_KEY in .env. "
             "Get your key at https://elevenlabs.io/app/settings/api-keys"
         )
-    r.raise_for_status()
+    if not r.ok:
+        # Include the API's own error message for easier debugging
+        try:
+            detail = r.json().get("detail", {})
+            msg = detail.get("message", r.text) if isinstance(detail, dict) else str(detail)
+        except Exception:
+            msg = r.text[:300]
+        raise RuntimeError(f"{r.status_code} {r.reason}: {msg}")
     return r.content
 
 
@@ -298,19 +461,32 @@ def generate_speech(
 # Per-row worker
 # ---------------------------------------------------------------------------
 
+class RowResult:
+    """Outcome of processing one CSV row."""
+    __slots__ = ("filename", "retried", "fixed", "unfixed")
+
+    def __init__(self, filename: str, retried: bool = False, fixed: bool = False, unfixed: bool = False):
+        self.filename = filename
+        self.retried = retried   # True if a retry was attempted
+        self.fixed   = fixed     # True if retry resolved the silence
+        self.unfixed = unfixed   # True if retry did NOT resolve the silence
+
+
 def process_one_row(
     api_key: str,
     text_raw: str,
     output_dir: Path,
+    unfixed_dir: Path | None,
     voice_id: str,
     model_id: str,
     output_format: str,
     speed: float | None,
     stability: float,
+    stretch: float | None,
     idx: int,
     total: int,
-) -> str:
-    """Generate TTS for one text entry and save to disk. Returns saved filename."""
+) -> RowResult:
+    """Generate TTS for one text entry and save to disk. Returns a RowResult."""
     text = text_raw.strip()
     if not text:
         raise ValueError("Empty text")
@@ -330,32 +506,47 @@ def process_one_row(
         )
 
     audio_bytes = _call_api()
+    retried = fixed = unfixed = False
 
     # --- Silence check: retry once if leading silence > 50% of total duration ---
     ratio = leading_silence_ratio(audio_bytes, ext)
     if ratio > MAX_LEADING_SILENCE_RATIO:
+        retried = True
         safe_print(
             f"  [{idx}/{total}] Leading silence {ratio:.0%} detected — retrying: {output_name}.{ext}"
         )
         retry_bytes = _call_api()
         retry_ratio = leading_silence_ratio(retry_bytes, ext)
+        audio_bytes = retry_bytes  # always use the retry result
+
         if retry_ratio > MAX_LEADING_SILENCE_RATIO:
+            unfixed = True
             safe_print(
-                f"  [{idx}/{total}] Retry still has {retry_ratio:.0%} leading silence — keeping retry: {output_name}.{ext}"
+                f"  [{idx}/{total}] Retry still has {retry_ratio:.0%} leading silence — flagged: {output_name}.{ext}"
             )
         else:
+            fixed = True
             safe_print(
                 f"  [{idx}/{total}] Retry OK ({retry_ratio:.0%} silence): {output_name}.{ext}"
             )
-        audio_bytes = retry_bytes  # always use the retry result
 
-    out_path = output_dir / f"{output_name}.{ext}"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # --- Optional post-process time stretch ---
+    if stretch is not None:
+        try:
+            audio_bytes = apply_time_stretch(audio_bytes, ext, stretch)
+        except Exception as e:
+            safe_print(f"  [{idx}/{total}] WARNING: time stretch failed ({e}) — saving original speed")
+
+    # Route unfixed files to the separate folder if configured
+    save_dir = (unfixed_dir if unfixed and unfixed_dir is not None else output_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = save_dir / f"{output_name}.{ext}"
     with open(out_path, "wb") as f:
         f.write(audio_bytes)
 
-    safe_print(f"  [{idx}/{total}] Saved: {out_path.name}")
-    return out_path.name
+    safe_print(f"  [{idx}/{total}] Saved: {out_path.relative_to(out_path.parent.parent)}")
+    return RowResult(filename=out_path.name, retried=retried, fixed=fixed, unfixed=unfixed)
 
 
 # ---------------------------------------------------------------------------
@@ -392,10 +583,6 @@ def main() -> None:
         help=f"Where to save audio files (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
-        "--model", type=str, default=DEFAULT_MODEL_ID,
-        help=f"ElevenLabs model ID (default: {DEFAULT_MODEL_ID})",
-    )
-    parser.add_argument(
         "--output-format", type=str, default=DEFAULT_OUTPUT_FORMAT,
         help=f"Audio format (default: {DEFAULT_OUTPUT_FORMAT})",
     )
@@ -420,9 +607,15 @@ def main() -> None:
         sys.exit(1)
 
     voice_label, voice_id = prompt_voice(voices)
-    speed = prompt_speed()
+    model_id = prompt_model()
+    speed = prompt_speed(model_id)
+    stretch = prompt_stretch()
     stability = prompt_stability()
     workers = prompt_workers()
+
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    unfixed_dir = prompt_unfixed_folder(output_dir)
 
     # --- Load CSV ---
     texts = load_texts_from_csv(csv_path)
@@ -430,21 +623,24 @@ def main() -> None:
         print("No text rows found in CSV.", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"\n{'='*50}")
     print(f"Voice     : {voice_label}")
-    print(f"Speed     : {speed if speed is not None else '1.0 (default)'}")
+    print(f"Model     : {model_id}")
+    print(f"API Speed : {speed if speed is not None else '1.0 (default)'}")
+    print(f"Stretch   : {stretch if stretch is not None else 'none'}")
     print(f"Stability : {stability}")
-    print(f"Model     : {args.model}")
     print(f"Rows      : {len(texts)}")
     print(f"Workers   : {workers}")
     print(f"Output    : {output_dir}")
+    if unfixed_dir:
+        print(f"Unfixed → : {unfixed_dir}")
     print(f"{'='*50}\n")
 
     # --- Generate in parallel ---
     total = len(texts)
+    results: list[RowResult] = []
+    api_errors = 0
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(
@@ -452,33 +648,52 @@ def main() -> None:
                 api_key,
                 text,
                 output_dir,
+                unfixed_dir,
                 voice_id,
-                args.model,
+                model_id,
                 args.output_format,
                 speed,
                 stability,
+                stretch,
                 i + 1,
                 total,
             ): text
             for i, text in enumerate(texts)
         }
-        failed = 0
         for future in as_completed(futures):
             text = futures[future]
             try:
-                future.result()
+                results.append(future.result())
             except Exception as e:
-                failed += 1
-                safe_print(
-                    f"  ERROR ({text[:50]!r}): {e}",
-                    file=sys.stderr,
-                )
+                api_errors += 1
+                safe_print(f"  ERROR ({text[:50]!r}): {e}", file=sys.stderr)
+
+    # --- Final stats ---
+    n_retried = sum(1 for r in results if r.retried)
+    n_fixed   = sum(1 for r in results if r.fixed)
+    n_unfixed = sum(1 for r in results if r.unfixed)
+    n_clean   = total - api_errors - n_retried
 
     print()
-    if failed:
-        print(f"Finished with {failed} error(s).", file=sys.stderr)
+    print(f"{'='*50}")
+    print(f"  SUMMARY")
+    print(f"{'='*50}")
+    print(f"  Total submitted     : {total}")
+    print(f"  Clean (no issue)    : {n_clean}")
+    print(f"  Issues detected     : {n_retried}")
+    print(f"    ↳ Fixed by retry  : {n_fixed}")
+    print(f"    ↳ Still unfixed   : {n_unfixed}")
+    if api_errors:
+        print(f"  API errors (failed) : {api_errors}")
+    if n_unfixed and unfixed_dir:
+        print(f"\n  Unfixed files saved to: {unfixed_dir}")
+    elif n_unfixed:
+        print(f"\n  Unfixed files are in the main output folder (flagged in log above).")
+    print(f"{'='*50}")
+    print(f"\n  All audio saved to: {output_dir}")
+
+    if api_errors:
         sys.exit(1)
-    print(f"All {total} files saved to: {output_dir}")
 
 
 if __name__ == "__main__":
